@@ -21,32 +21,6 @@ public class ComplexityAnalysisServiceTests
         _service = new ComplexityAnalysisService(_solutionManager, _logger);
     }
 
-    private static (Compilation compilation, IMethodSymbol methodSymbol) CreateCompilationWithMethod(string code)
-    {
-        var syntaxTree = CSharpSyntaxTree.ParseText(code);
-        var references = new[]
-        {
-            MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-            MetadataReference.CreateFromFile(typeof(Console).Assembly.Location),
-            MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location),
-            MetadataReference.CreateFromFile(System.Reflection.Assembly.Load("System.Runtime").Location)
-        };
-
-        var compilation = CSharpCompilation.Create("TestAssembly",
-            new[] { syntaxTree },
-            references,
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
-
-        var semanticModel = compilation.GetSemanticModel(syntaxTree);
-        var root = syntaxTree.GetRoot();
-        var methodDeclaration = root.DescendantNodes()
-            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax>()
-            .First();
-        var methodSymbol = semanticModel.GetDeclaredSymbol(methodDeclaration)!;
-
-        return (compilation, methodSymbol);
-    }
-
     [Test]
     public async Task AnalyzeMethodAsync_SimpleMethod_HasBasicComplexityOfOne()
     {
@@ -59,7 +33,7 @@ public class TestClass
         var y = 2;
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -85,7 +59,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -110,7 +84,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -135,7 +109,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -160,7 +134,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -196,7 +170,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -221,7 +195,7 @@ public class TestClass
         var z = 3;
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -246,7 +220,7 @@ public class TestClass
         var x = 1;
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -277,7 +251,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -302,7 +276,7 @@ public class TestClass
         return x > 0 ? x : -x;
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -328,7 +302,7 @@ public class TestClass
         } while (x > 0);
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();
@@ -355,7 +329,7 @@ public class TestClass
         }
     }
 }";
-        var (compilation, methodSymbol) = CreateCompilationWithMethod(code);
+        var (compilation, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
         _solutionManager.CurrentSolution.Returns((Solution?)null);
 
         var metrics = new Dictionary<string, object>();

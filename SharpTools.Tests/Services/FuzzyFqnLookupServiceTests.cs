@@ -30,7 +30,7 @@ namespace TestNs
         public void Method() { }
     }
 }";
-        var (_, typeSymbol) = CreateCompilationWithType(code, "NonPartialClass");
+        var (_, typeSymbol) = RoslynTestHelpers.CreateCompilationWithType(code, "TestNs.NonPartialClass");
 
         var result = FuzzyFqnLookupService.IsPartialType(typeSymbol);
 
@@ -48,7 +48,7 @@ namespace TestNs
         public void Method() { }
     }
 }";
-        var (_, typeSymbol) = CreateCompilationWithType(code, "PartialClass");
+        var (_, typeSymbol) = RoslynTestHelpers.CreateCompilationWithType(code, "TestNs.PartialClass");
 
         var result = FuzzyFqnLookupService.IsPartialType(typeSymbol);
 
@@ -66,18 +66,7 @@ namespace TestNs
         public void TestMethod() { }
     }
 }";
-        var syntaxTree = CSharpSyntaxTree.ParseText(code);
-        var compilation = CSharpCompilation.Create("TestAssembly",
-            new[] { syntaxTree },
-            new[] { MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-                    MetadataReference.CreateFromFile(System.Reflection.Assembly.Load("System.Runtime").Location) },
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
-
-        var semanticModel = compilation.GetSemanticModel(syntaxTree);
-        var methodDeclaration = syntaxTree.GetRoot().DescendantNodes()
-            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax>()
-            .First();
-        var methodSymbol = semanticModel.GetDeclaredSymbol(methodDeclaration)!;
+        var (_, methodSymbol) = RoslynTestHelpers.CreateCompilationWithMethod(code);
 
         var result = FuzzyFqnLookupService.IsPartialType(methodSymbol);
 
@@ -100,23 +89,5 @@ namespace TestNs
     {
         await Assert.That(() => new FuzzyFqnLookupService(null!))
             .ThrowsExactly<ArgumentNullException>();
-    }
-
-    private static (Compilation, INamedTypeSymbol) CreateCompilationWithType(string code, string typeName)
-    {
-        var syntaxTree = CSharpSyntaxTree.ParseText(code);
-        var references = new[]
-        {
-            MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-            MetadataReference.CreateFromFile(System.Reflection.Assembly.Load("System.Runtime").Location)
-        };
-
-        var compilation = CSharpCompilation.Create("TestAssembly",
-            new[] { syntaxTree },
-            references,
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
-
-        var typeSymbol = compilation.GetTypeByMetadataName($"TestNs.{typeName}")!;
-        return (compilation, typeSymbol);
     }
 }
