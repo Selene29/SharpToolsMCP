@@ -43,10 +43,18 @@ namespace SharpTools.Tools.Services {
             }
 
             return typeSymbol.DeclaringSyntaxReferences.Length > 1 ||
-                typeSymbol.DeclaringSyntaxReferences.Any(syntax =>
-                    syntax.GetSyntax() is Microsoft.CodeAnalysis.CSharp.Syntax.BaseTypeDeclarationSyntax declaration &&
-                    declaration.Modifiers.Any(modifier =>
-                        modifier.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword)));
+                typeSymbol.DeclaringSyntaxReferences.Any(syntax => {
+                    var node = syntax.GetSyntax();
+                    // C# partial check
+                    if (node is Microsoft.CodeAnalysis.CSharp.Syntax.BaseTypeDeclarationSyntax csDecl) {
+                        return csDecl.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword));
+                    }
+                    // VB.NET partial check
+                    if (node is Microsoft.CodeAnalysis.VisualBasic.Syntax.TypeStatementSyntax vbTypeStmt) {
+                        return vbTypeStmt.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.PartialKeyword));
+                    }
+                    return false;
+                });
         }
         /// <inheritdoc />
         public async Task<IEnumerable<FuzzyMatchResult>> FindMatchesAsync(string fuzzyFqnInput, ISolutionManager solutionManager, CancellationToken cancellationToken) {

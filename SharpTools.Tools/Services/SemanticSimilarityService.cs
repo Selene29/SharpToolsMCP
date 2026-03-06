@@ -539,15 +539,41 @@ namespace SharpTools.Tools.Services {
                     var semanticModel = await document.GetSemanticModelAsync(docCt);
                     if (syntaxTree == null || semanticModel == null) return;
 
-                    var classDeclarations = syntaxTree.GetRoot(docCt).DescendantNodes()
-                        .OfType<TypeDeclarationSyntax>()
-                        .Where(tds => tds.Kind() == Microsoft.CodeAnalysis.CSharp.SyntaxKind.ClassDeclaration ||
-                                      tds.Kind() == Microsoft.CodeAnalysis.CSharp.SyntaxKind.RecordDeclaration);
+                    var root = syntaxTree.GetRoot(docCt);
+                    bool isVBDocument = document.Project.Language == LanguageNames.VisualBasic;
 
-                    foreach (var classDecl in classDeclarations) {
+                    IEnumerable<SyntaxNode> classNodes;
+                    if (isVBDocument) {
+                        // VB.NET: look for ClassBlockSyntax
+                        classNodes = root.DescendantNodes()
+                            .Where(n => n is Microsoft.CodeAnalysis.VisualBasic.Syntax.ClassBlockSyntax);
+                    } else {
+                        // C#: look for class and record declarations
+                        classNodes = root.DescendantNodes()
+                            .OfType<TypeDeclarationSyntax>()
+                            .Where(tds => tds.Kind() == Microsoft.CodeAnalysis.CSharp.SyntaxKind.ClassDeclaration ||
+                                          tds.Kind() == Microsoft.CodeAnalysis.CSharp.SyntaxKind.RecordDeclaration);
+                    }
+
+                    foreach (var classNode in classNodes) {
                         if (docCt.IsCancellationRequested) break;
 
-                        var classSymbol = semanticModel.GetDeclaredSymbol(classDecl, docCt) as INamedTypeSymbol;
+                        INamedTypeSymbol? classSymbol = null;
+                        SyntaxNode classDecl = classNode;
+
+                        if (isVBDocument) {
+                            if (classNode is Microsoft.CodeAnalysis.VisualBasic.Syntax.ClassBlockSyntax vbClass) {
+                                // For VB.NET, use the class statement's identifier location to look up the declared symbol
+                                var identifierLocation = vbClass.ClassStatement.Identifier.SpanStart;
+                                classSymbol = semanticModel.GetEnclosingSymbol(identifierLocation, docCt) as INamedTypeSymbol
+                                    ?? semanticModel.LookupSymbols(identifierLocation, name: vbClass.ClassStatement.Identifier.Text)
+                                        .OfType<INamedTypeSymbol>()
+                                        .FirstOrDefault();
+                            }
+                        } else {
+                            classSymbol = semanticModel.GetDeclaredSymbol(classNode, docCt) as INamedTypeSymbol;
+                        }
+
                         if (classSymbol == null || classSymbol.IsAbstract || classSymbol.IsStatic) {
                             continue;
                         }
@@ -577,7 +603,7 @@ namespace SharpTools.Tools.Services {
 
         private async Task<ClassSemanticFeatures?> ExtractClassFeaturesAsync(
             INamedTypeSymbol classSymbol,
-            TypeDeclarationSyntax classDecl,
+            SyntaxNode classDecl,
             Document document,
             SemanticModel semanticModel,
             CancellationToken cancellationToken) {

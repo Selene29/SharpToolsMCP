@@ -3,6 +3,7 @@ using DiffPlex.DiffBuilder.Model;
 using ModelContextProtocol;
 using SharpTools.Tools.Services;
 using System.Text.Json;
+using VBSyntax = Microsoft.CodeAnalysis.VisualBasic.Syntax;
 
 namespace SharpTools.Tools.Mcp.Tools;
 
@@ -1490,13 +1491,13 @@ public static partial class AnalysisTools {
         }, logger, nameof(SearchDefinitions), cancellationToken);
     }
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ManageUsings), Idempotent = true, ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Reads or writes using directives in a document.")]
+    [Description("Reads or writes using directives (C#) or Imports statements (VB.NET) in a document.")]
     public static async Task<object> ManageUsings(
                             ISolutionManager solutionManager,
                             ICodeModificationService modificationService,
                             ILogger<AnalysisToolsLogCategory> logger,
                             [Description("'read' or 'write'. For 'read', set codeToWrite to 'None'.")] string operation,
-                            [Description("For 'read', must be 'None'. For 'write', provide all using directives that should exist in the file. This will replace all existing usings.")] string codeToWrite,
+                            [Description("For 'read', must be 'None'. For 'write', provide all using/Imports directives that should exist in the file. This will replace all existing usings.")] string codeToWrite,
                             [Description("The absolute path to the file to manage usings in")] string filePath,
                             CancellationToken cancellationToken) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
@@ -1527,7 +1528,11 @@ public static partial class AnalysisTools {
 
             var root = await document.GetSyntaxRootAsync(cancellationToken) ?? throw new McpException($"Could not get syntax root for file '{filePath}'.");
 
-            // Find the global usings file for the project
+            bool isVB = document.Project.Language == LanguageNames.VisualBasic;
+
+            if (isVB) {
+                return await ManageUsingsVBAsync(document, root, operation, codeToWrite, modificationService, cancellationToken);
+            }
             var globalUsingsFile = document.Project.Documents
                 .FirstOrDefault(d => d.Name.Equals("GlobalUsings.cs", StringComparison.OrdinalIgnoreCase));
 
@@ -1644,14 +1649,24 @@ public static partial class AnalysisTools {
 
             if (operation == "read") {
                 // Get only the attributes on this node, not nested ones
-                var attributeLists = node switch {
-                    MemberDeclarationSyntax mDecl => mDecl.AttributeLists,
-                    StatementSyntax stmt => stmt.AttributeLists,
-                    _ => SyntaxFactory.List<AttributeListSyntax>()
-                };
-
-                var attributes = string.Join("\n", attributeLists.Select(al => al.ToString().Trim()));
+                string attributes;
                 var lineSpan = node.GetLocation().GetLineSpan();
+
+                if (node.Language == LanguageNames.VisualBasic) {
+                    // VB.NET: attributes are AttributeListSyntax on declarations
+                    var vbAttributeLists = node switch {
+                        Microsoft.CodeAnalysis.VisualBasic.Syntax.DeclarationStatementSyntax vbDecl => vbDecl.ChildNodes().OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.AttributeListSyntax>().ToList(),
+                        _ => node.ChildNodes().OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.AttributeListSyntax>().ToList()
+                    };
+                    attributes = string.Join("\n", vbAttributeLists.Select(al => al.ToString().Trim()));
+                } else {
+                    var attributeLists = node switch {
+                        MemberDeclarationSyntax mDecl => mDecl.AttributeLists,
+                        StatementSyntax stmt => stmt.AttributeLists,
+                        _ => SyntaxFactory.List<AttributeListSyntax>()
+                    };
+                    attributes = string.Join("\n", attributeLists.Select(al => al.ToString().Trim()));
+                }
 
                 if (string.IsNullOrEmpty(attributes)) {
                     attributes = "No attributes found.";
@@ -1664,7 +1679,55 @@ public static partial class AnalysisTools {
                 });
             }
 
-            // Write operation
+            bool isVBNode = node.Language == LanguageNames.VisualBasic;
+
+            if (isVBNode) {
+                // VB.NET write path
+                Microsoft.CodeAnalysis.VisualBasic.Syntax.AttributeListSyntax[]? newVBAttributeLists;
+                try {
+                    // Parse VB attribute syntax: wrap in a class declaration
+                    var tempCode = $"{(codeToWrite.Length == 0 ? "" : codeToWrite + "\n")}Public Class _AttributePlaceholder_\nEnd Class";
+                    newVBAttributeLists = Microsoft.CodeAnalysis.VisualBasic.VisualBasicSyntaxTree.ParseText(tempCode)
+                        .GetRoot()
+                        .DescendantNodes()
+                        .OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.ClassBlockSyntax>()
+                        .First()
+                        .ClassStatement
+                        .AttributeLists
+                        .ToArray();
+                } catch (Exception ex) {
+                    throw new McpException($"Failed to parse VB.NET attributes: {ex.Message}");
+                }
+
+                var vbDocument = solutionManager.CurrentSolution?.GetDocument(syntaxRef.SyntaxTree)
+                    ?? throw new McpException("Could not find document for syntax tree.");
+                var vbEditor = await DocumentEditor.CreateAsync(vbDocument, cancellationToken);
+                // Replace the node with attribute-updated version using the editor
+                // For VB.NET, we rebuild the declaration's attribute lists
+                var originalText = node.ToFullString();
+                var attrText = string.Join("\n", newVBAttributeLists.Select(al => al.ToString().Trim()));
+                // Use ReplaceNode to apply the change (VB-specific attribute nodes need to be replaced)
+                // Since VB attribute replacement is complex, we use the document editor's ReplaceNode with a parsed version
+                var newVBCode = attrText + (attrText.Length > 0 ? "\n" : "") +
+                    node.WithoutLeadingTrivia().WithoutTrailingTrivia().ToFullString().TrimStart('<');
+                // Simpler: just replace the node using our VB-aware OverwriteMember approach
+                var vbNewNode = Microsoft.CodeAnalysis.VisualBasic.VisualBasicSyntaxTree.ParseText(attrText + "\n" + node.ToFullString().TrimStart())
+                    .GetRoot()
+                    .DescendantNodes()
+                    .FirstOrDefault(n => n.IsKind(node.Kind())) ?? node;
+
+                vbEditor.ReplaceNode(node, vbNewNode);
+                var vbChanged = vbEditor.GetChangedDocument();
+                var vbFormatted = await modificationService.FormatDocumentAsync(vbChanged, cancellationToken);
+                await modificationService.ApplyChangesAsync(vbFormatted.Project.Solution, cancellationToken, "Manage Attributes");
+
+                string vbDiff = ContextInjectors.CreateCodeDiff(originalText, vbNewNode.ToFullString());
+                return string.IsNullOrWhiteSpace(vbDiff) || vbDiff.Trim() == "// No changes detected."
+                    ? "Attribute update was successful but no difference was detected."
+                    : "Successfully updated attributes. Diff:\n" + vbDiff;
+            }
+
+            // Write operation (C#)
             if (!(node is MemberDeclarationSyntax memberDecl)) {
                 throw new McpException("Target declaration is not a valid member declaration.");
             }
@@ -1672,7 +1735,7 @@ public static partial class AnalysisTools {
             SyntaxList<AttributeListSyntax> newAttributeLists;
             try {
                 // Parse the attributes by wrapping in minimal valid syntax
-                var tempCode = $"{(codeToWrite.Length == 0 ? "" : codeToWrite + "\n")}public class C {{ }}";
+                var tempCode = $"{(codeToWrite.Length == 0 ? "" : codeToWrite + "\n")}public class _AttributePlaceholder_ {{ }}";
                 newAttributeLists = CSharpSyntaxTree.ParseText(tempCode)
                     .GetRoot()
                     .DescendantNodes()
@@ -1802,4 +1865,62 @@ public static partial class AnalysisTools {
 
     [GeneratedRegex(@"\s*\bclass\b\s*")]
     private static partial Regex ClassRegex();
+
+    /// <summary>
+    /// Handles ManageUsings for VB.NET files using Imports statements.
+    /// </summary>
+    private static async Task<object> ManageUsingsVBAsync(
+        Document document,
+        SyntaxNode root,
+        string operation,
+        string codeToWrite,
+        ICodeModificationService modificationService,
+        CancellationToken cancellationToken) {
+        if (root is not VBSyntax.CompilationUnitSyntax vbCompilationUnit) {
+            throw new McpException("Could not get VB.NET compilation unit from file.");
+        }
+
+        string filePath = document.FilePath ?? string.Empty;
+
+        if (operation == "read") {
+            var importStatements = vbCompilationUnit.Imports
+                .SelectMany(i => i.ImportsClauses)
+                .Select(c => $"Imports {c.ToFullString().Trim()}")
+                .ToList();
+
+            return ToolHelpers.ToJson(new {
+                file = filePath,
+                imports = string.Join("\n", importStatements),
+                globalImports = "(VB.NET global imports are defined in the .vbproj file, not in source files)"
+            });
+        }
+
+        // Write operation: parse the provided Imports lines and update the file
+        var newImportLines = codeToWrite.Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .ToList();
+
+        // Parse the new imports block using the VB parser
+        // A placeholder class is needed to create a valid VB.NET compilation unit for parsing
+        var importCode = string.Join("\n", newImportLines) + "\nClass _ImportsParsingPlaceholder_\nEnd Class\n";
+        var parsedTree = Microsoft.CodeAnalysis.VisualBasic.VisualBasicSyntaxTree.ParseText(importCode);
+        var parsedRoot = parsedTree.GetRoot(cancellationToken) as VBSyntax.CompilationUnitSyntax;
+        if (parsedRoot == null) {
+            throw new McpException("Failed to parse VB.NET Imports statements.");
+        }
+
+        var newImports = parsedRoot.Imports;
+        var newVBRoot = vbCompilationUnit.WithImports(newImports);
+
+        var newDocument = document.WithSyntaxRoot(newVBRoot);
+        var formatted = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
+        await modificationService.ApplyChangesAsync(formatted.Project.Solution, cancellationToken, "Manage Imports");
+
+        string diffResult = ContextInjectors.CreateCodeDiff(root.ToFullString(), newVBRoot.ToFullString());
+        if (diffResult.Trim() == "// No changes detected.") {
+            return "Imports update was successful but no difference was detected.";
+        }
+        return "Successfully updated Imports. Diff:\n" + diffResult;
+    }
 }

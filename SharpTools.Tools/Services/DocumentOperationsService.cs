@@ -17,7 +17,7 @@ public class DocumentOperationsService : IDocumentOperationsService {
 
     // Extensions for common code file types that can be formatted
     private static readonly HashSet<string> CodeFileExtensions = new(StringComparer.OrdinalIgnoreCase) {
-        ".cs", ".csproj", ".sln", ".css", ".js", ".ts", ".jsx", ".tsx", ".html", ".cshtml", ".razor", ".yml", ".yaml",
+        ".cs", ".csproj", ".vbproj", ".sln", ".css", ".js", ".ts", ".jsx", ".tsx", ".html", ".cshtml", ".razor", ".yml", ".yaml",
         ".json", ".xml", ".config", ".md", ".fs", ".fsx", ".fsi", ".vb"
     };
 

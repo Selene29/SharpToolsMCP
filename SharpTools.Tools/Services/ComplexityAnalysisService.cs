@@ -35,9 +35,18 @@ public class ComplexityAnalysisService : IComplexityAnalysisService {
             return;
         }
 
-        var methodNode = await syntaxRef.GetSyntaxAsync(cancellationToken) as MethodDeclarationSyntax;
+        var syntaxNode = await syntaxRef.GetSyntaxAsync(cancellationToken);
+        var methodNode = syntaxNode as MethodDeclarationSyntax;
         if (methodNode == null) {
-            _logger.LogWarning("Could not get method syntax for {Method}", methodSymbol.Name);
+            // VB.NET or other language – skip C#-specific syntax analysis but record basic metrics
+            _logger.LogDebug("Method {Method} is not a C# MethodDeclarationSyntax (language: {Language}); providing basic metrics only (full complexity analysis requires C# syntax)", methodSymbol.Name, syntaxNode?.Language ?? "unknown");
+            var basicLineCount = syntaxNode?.GetText().Lines.Count ?? 0;
+            metrics["lineCount"] = basicLineCount;
+            metrics["parameterCount"] = methodSymbol.Parameters.Length;
+            if (basicLineCount > 50)
+                recommendations.Add($"Method '{methodSymbol.Name}' is {basicLineCount} lines long. Consider breaking it into smaller methods.");
+            if (methodSymbol.Parameters.Length > 4)
+                recommendations.Add($"Method '{methodSymbol.Name}' has {methodSymbol.Parameters.Length} parameters. Consider grouping related parameters into a class.");
             return;
         }
 

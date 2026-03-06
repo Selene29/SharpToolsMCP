@@ -20,6 +20,9 @@ using ModelContextProtocol;
 using SharpTools.Tools.Interfaces;
 using SharpTools.Tools.Mcp;
 using SharpTools.Tools.Services;
+using VBSyntax = Microsoft.CodeAnalysis.VisualBasic.Syntax;
+using VBSyntaxFactory = Microsoft.CodeAnalysis.VisualBasic.SyntaxFactory;
+using VisualBasicSyntaxTree = Microsoft.CodeAnalysis.VisualBasic.VisualBasicSyntaxTree;
 
 namespace SharpTools.Tools.Mcp.Tools;
 
@@ -29,7 +32,7 @@ public class ModificationToolsLogCategory { }
 [McpServerToolType]
 public static class ModificationTools {
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("Adds one or more new member definitions (Property, Field, Method, inner Class, etc.) to a specified type. Code is parsed, inserted, and formatted. Definition can include xml documentation and attributes. Writing small components produces cleaner code, so you can use this to break up large components, in addition to adding new functionality.")]
+    [Description("Adds one or more new member definitions (Property, Field, Method, inner Class, etc.) to a specified type. Code is parsed, inserted, and formatted. Definition can include xml documentation and attributes. Writing small components produces cleaner code, so you can use this to break up large components, in addition to adding new functionality. Supports C# and VB.NET.")]
     public static async Task<string> AddMember(
         ISolutionManager solutionManager,
         ICodeModificationService modificationService,
@@ -37,7 +40,7 @@ public static class ModificationTools {
         ISemanticSimilarityService semanticSimilarityService,
         ILogger<ModificationToolsLogCategory> logger,
         [Description("FQN of the parent type or method.")] string fullyQualifiedTargetName,
-        [Description("The C# code to add.")] string codeSnippet,
+        [Description("The code to add (C# or VB.NET, matching the target file's language).")] string codeSnippet,
         [Description("If the target is a partial type, specifies which file to add to. Set to 'auto' to determine automatically.")] string fileNameHint,
         [Description("Suggest a line number to insert the member near. '-1' to determine automatically.")] int lineNumberHint,
         string commitMessage,
@@ -81,8 +84,16 @@ public static class ModificationTools {
                 throw new McpException($"Target '{fullyQualifiedTargetName}' is not a type, cannot add member.");
             }
 
-            // Parse the code snippet
+            // Parse the code snippet – use the parser matching the document's language
             MemberDeclarationSyntax? memberSyntax;
+            var documentLanguage = document.Project.Language;
+            if (documentLanguage == LanguageNames.VisualBasic) {
+                // VB.NET: use a language-agnostic editor path; AddMemberAsync is C#-only,
+                // so we apply the change inline here for VB projects.
+                return await AddMemberVBAsync(solutionManager, modificationService, complexityAnalysisService,
+                    semanticSimilarityService, logger, fullyQualifiedTargetName, codeSnippet,
+                    document, typeSymbol, lineNumberHint, commitMessage, cancellationToken);
+            }
             try {
                 memberSyntax = SyntaxFactory.ParseMemberDeclaration(codeSnippet);
                 if (memberSyntax == null) {
@@ -222,14 +233,82 @@ public static class ModificationTools {
             return !typeSymbol.GetMembers(memberName).Any(m => !m.IsImplicitlyDeclared);
         }
     }
+    /// <summary>
+    /// Adds a member to a VB.NET type using VB-specific syntax parsing and a language-agnostic editor.
+    /// </summary>
+    private static async Task<string> AddMemberVBAsync(
+        ISolutionManager solutionManager,
+        ICodeModificationService modificationService,
+        IComplexityAnalysisService complexityAnalysisService,
+        ISemanticSimilarityService semanticSimilarityService,
+        ILogger<ModificationToolsLogCategory> logger,
+        string fullyQualifiedTargetName,
+        string codeSnippet,
+        Document document,
+        INamedTypeSymbol typeSymbol,
+        int lineNumberHint,
+        string commitMessage,
+        CancellationToken cancellationToken) {
+        // Parse the VB.NET code snippet
+        var vbTree = VisualBasicSyntaxTree.ParseText(codeSnippet);
+        var vbRoot = vbTree.GetRoot(cancellationToken) as VBSyntax.CompilationUnitSyntax;
+        var newMember = vbRoot?.Members.FirstOrDefault();
+        if (newMember == null) {
+            throw new McpException("Failed to parse VB.NET code snippet as a valid member declaration.");
+        }
+
+        // Find the type declaration node in the document
+        var typeDeclarationSyntaxRef = typeSymbol.DeclaringSyntaxReferences.FirstOrDefault(sr =>
+            sr.SyntaxTree.FilePath == document.FilePath);
+        typeDeclarationSyntaxRef ??= typeSymbol.DeclaringSyntaxReferences.FirstOrDefault();
+        if (typeDeclarationSyntaxRef == null) {
+            throw new McpException($"Could not find syntax reference for type '{fullyQualifiedTargetName}'.");
+        }
+        var typeDeclarationNode = await typeDeclarationSyntaxRef.GetSyntaxAsync(cancellationToken);
+
+        // Use a language-agnostic document editor to insert the member
+        var editor = await DocumentEditor.CreateAsync(document, cancellationToken);
+        editor.AddMember(typeDeclarationNode, newMember);
+
+        var changedDocument = editor.GetChangedDocument();
+        var formattedDocument = await modificationService.FormatDocumentAsync(changedDocument, cancellationToken);
+        var newSolution = formattedDocument.Project.Solution;
+
+        string memberName = "UnknownMember";
+        // Try to extract a meaningful name
+        if (newMember is VBSyntax.MethodBlockSyntax methodBlock)
+            memberName = methodBlock.SubOrFunctionStatement.Identifier.Text;
+        else if (newMember is VBSyntax.PropertyBlockSyntax propBlock)
+            memberName = propBlock.PropertyStatement.Identifier.Text;
+        else if (newMember is VBSyntax.FieldDeclarationSyntax fieldDecl)
+            memberName = fieldDecl.Declarators.FirstOrDefault()?.Names.FirstOrDefault()?.Identifier.Text ?? memberName;
+        else if (newMember is VBSyntax.ClassBlockSyntax classBlock)
+            memberName = classBlock.ClassStatement.Identifier.Text;
+
+        string finalCommitMessage = $"Add {memberName} to {typeSymbol.Name}: " + commitMessage;
+        await modificationService.ApplyChangesAsync(newSolution, cancellationToken, finalCommitMessage);
+
+        var updatedDocument = solutionManager.CurrentSolution?.GetDocument(document.Id);
+        if (updatedDocument is null) {
+            throw new McpException($"Failed to retrieve updated document for {fullyQualifiedTargetName} after applying changes.");
+        }
+        var (hasErrors, errorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
+            solutionManager, updatedDocument, logger, cancellationToken);
+
+        string baseMessage = $"Successfully added member to {fullyQualifiedTargetName} in {document.FilePath ?? "unknown file"}.\n\n" +
+            ((!hasErrors) ? "<errorCheck>No compilation issues detected.</errorCheck>" :
+            ($"{errorMessages}\n" +
+            $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember)} to replace the member with a new definition."));
+        return baseMessage;
+    }
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Replaces the definition of an existing member or type with new C# code, or deletes it. Code is parsed and formatted. Code can contain multiple new members, update the existing member, and/or replace it with a new one.")]
+    [Description("Replaces the definition of an existing member or type with new code, or deletes it. Code is parsed and formatted. Code can contain multiple new members, update the existing member, and/or replace it with a new one. Supports C# and VB.NET.")]
     public static async Task<string> OverwriteMember(
         ISolutionManager solutionManager,
         ICodeModificationService modificationService,
         ILogger<ModificationToolsLogCategory> logger,
         [Description("FQN of the member or type to rewrite.")] string fullyQualifiedMemberName,
-        [Description("The new C# code for the member or type. *If this member has attributes or XML documentation, they MUST be included here.* To Delete the target instead, set this to `// Delete {memberName}`.")] string newMemberCode,
+        [Description("The new code for the member or type (C# or VB.NET, matching the target file's language). *If this member has attributes or XML documentation, they MUST be included here.* To Delete the target instead, set this to `// Delete {memberName}` (C#) or `' Delete {memberName}` (VB.NET).")] string newMemberCode,
         string commitMessage,
         CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
@@ -255,16 +334,46 @@ public static class ModificationTools {
 
             var document = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solutionManager.CurrentSolution, oldNode);
 
-            if (oldNode is not MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax) {
+            bool isVB = document.Project.Language == LanguageNames.VisualBasic;
+
+            // For C#, validate the node type; for VB, any SyntaxNode is valid
+            if (!isVB && oldNode is not MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax) {
                 throw new McpException($"Symbol '{fullyQualifiedMemberName}' does not represent a replaceable member or type.");
             }
 
             // Get a simple name for the symbol for the commit message
             string symbolName = symbol.Name;
 
-            bool isDelete = newMemberCode.StartsWith("// Delete", StringComparison.OrdinalIgnoreCase);
+            // Deletion markers: "// Delete" for C#, "' Delete" for VB.NET
+            bool isDelete = newMemberCode.StartsWith("// Delete", StringComparison.OrdinalIgnoreCase)
+                || (isVB && newMemberCode.TrimStart().StartsWith("' Delete", StringComparison.OrdinalIgnoreCase));
             string finalCommitMessage = (isDelete ? $"Delete {symbolName}" : $"Update {symbolName}") + ": " + commitMessage;
             if (isDelete) {
+                if (isVB) {
+                    // VB.NET deletion: remove the node directly using a language-agnostic editor
+                    try {
+                        var vbEditor = await DocumentEditor.CreateAsync(document, cancellationToken);
+                        vbEditor.RemoveNode(oldNode);
+                        var vbChangedDoc = vbEditor.GetChangedDocument();
+                        var vbFormattedDoc = await modificationService.FormatDocumentAsync(vbChangedDoc, cancellationToken);
+                        var vbNewSolution = vbFormattedDoc.Project.Solution;
+                        await modificationService.ApplyChangesAsync(vbNewSolution, cancellationToken, finalCommitMessage);
+
+                        var vbUpdatedDoc = solutionManager.CurrentSolution?.GetDocument(document.Id);
+                        if (vbUpdatedDoc != null) {
+                            var (vbHasErrors, vbErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
+                                solutionManager, vbUpdatedDoc, logger, cancellationToken);
+                            if (!vbHasErrors)
+                                vbErrorMessages = "<errorCheck>No compilation issues detected.</errorCheck>";
+                            return $"Successfully deleted symbol {fullyQualifiedMemberName}.\n\n{vbErrorMessages}";
+                        }
+                        return $"Successfully deleted symbol {fullyQualifiedMemberName}";
+                    } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
+                        logger.LogError(ex, "Failed to delete VB.NET symbol {SymbolName}", fullyQualifiedMemberName);
+                        throw new McpException($"Failed to delete symbol {fullyQualifiedMemberName}: {ex.Message}");
+                    }
+                }
+
                 var commentTrivia = SyntaxFactory.Comment(newMemberCode);
                 var emptyNode = SyntaxFactory.EmptyStatement()
                     .WithLeadingTrivia(commentTrivia)
@@ -292,25 +401,34 @@ public static class ModificationTools {
 
             SyntaxNode? newNode;
             try {
-                var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
-                newNode = parsedCode.Members.FirstOrDefault();
+                if (isVB) {
+                    // VB.NET: parse with the VB parser
+                    var vbTree = VisualBasicSyntaxTree.ParseText(newMemberCode);
+                    var vbRoot = vbTree.GetRoot(cancellationToken) as VBSyntax.CompilationUnitSyntax;
+                    newNode = vbRoot?.Members.FirstOrDefault();
+                    if (newNode is null) {
+                        throw new McpException("Failed to parse VB.NET code as a valid member or type declaration. The parsed result was empty.");
+                    }
+                } else {
+                    var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
+                    newNode = parsedCode.Members.FirstOrDefault();
 
-                if (newNode is null) {
-                    throw new McpException("Failed to parse new code as a valid member or type declaration. The parsed result was empty.");
-                }
+                    if (newNode is null) {
+                        throw new McpException("Failed to parse new code as a valid member or type declaration. The parsed result was empty.");
+                    }
 
-                // Validate that the parsed node is of an expected type if the original was a TypeDeclaration
-                if (oldNode is TypeDeclarationSyntax && newNode is not TypeDeclarationSyntax) {
-                    throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a TypeDeclaration was expected to replace the existing TypeDeclaration.");
+                    // Validate that the parsed node is of an expected type if the original was a TypeDeclaration
+                    if (oldNode is TypeDeclarationSyntax && newNode is not TypeDeclarationSyntax) {
+                        throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a TypeDeclaration was expected to replace the existing TypeDeclaration.");
+                    }
+                    // Validate that the parsed node is of an expected type if the original was a MemberDeclaration (but not a TypeDeclaration, which is a subtype)
+                    else if (oldNode is MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax && newNode is not MemberDeclarationSyntax) {
+                        throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a MemberDeclaration was expected to replace the existing MemberDeclaration.");
+                    }
                 }
-                // Validate that the parsed node is of an expected type if the original was a MemberDeclaration (but not a TypeDeclaration, which is a subtype)
-                else if (oldNode is MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax && newNode is not MemberDeclarationSyntax) {
-                    throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a MemberDeclaration was expected to replace the existing MemberDeclaration.");
-                }
-
             } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
                 logger.LogError(ex, "Failed to parse replacement code for {SymbolName}", fullyQualifiedMemberName);
-                throw new McpException($"Invalid C# syntax in replacement code: {ex.Message}");
+                throw new McpException($"Invalid syntax in replacement code: {ex.Message}");
             }
 
             if (newNode is null) { // Should be caught by earlier checks, but as a safeguard.
@@ -318,7 +436,17 @@ public static class ModificationTools {
             }
 
             try {
-                var newSolution = await modificationService.ReplaceNodeAsync(document.Id, oldNode, newNode, cancellationToken);
+                Solution newSolution;
+                if (isVB) {
+                    // For VB.NET, use a language-agnostic document editor to replace the node
+                    var vbEditor = await DocumentEditor.CreateAsync(document, cancellationToken);
+                    vbEditor.ReplaceNode(oldNode, newNode);
+                    var vbChangedDoc = vbEditor.GetChangedDocument();
+                    var vbFormattedDoc = await modificationService.FormatDocumentAsync(vbChangedDoc, cancellationToken);
+                    newSolution = vbFormattedDoc.Project.Solution;
+                } else {
+                    newSolution = await modificationService.ReplaceNodeAsync(document.Id, oldNode, newNode, cancellationToken);
+                }
                 await modificationService.ApplyChangesAsync(newSolution, cancellationToken, finalCommitMessage);
 
                 if (solutionManager.CurrentSolution is null) {
@@ -364,17 +492,17 @@ public static class ModificationTools {
             ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
             ErrorHandlingHelpers.ValidateStringParameter(newName, "newName", logger);
 
-            // Validate that the new name is a valid C# identifier
-            if (!IsValidCSharpIdentifier(newName)) {
-                throw new McpException($"'{newName}' is not a valid C# identifier for renaming.");
-            }
-
-            // Ensure solution is loaded
+            // Ensure solution is loaded first so we can find the symbol and check its language
             ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(RenameSymbol));
             logger.LogInformation("Executing '{RenameSymbol}' for {SymbolName} to {NewName}", nameof(RenameSymbol), fullyQualifiedSymbolName, newName);
 
             // Get the symbol to rename
             var symbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedSymbolName, cancellationToken);
+
+            // Validate the new name is a valid identifier for the symbol's language
+            if (!IsValidIdentifier(newName, symbol.Language)) {
+                throw new McpException($"'{newName}' is not a valid identifier for {symbol.Language} renaming.");
+            }
 
             // Check if symbol is renamable
             if (symbol.IsImplicitlyDeclared) {
@@ -439,20 +567,24 @@ public static class ModificationTools {
             }
         }, logger, nameof(RenameSymbol), cancellationToken);
     }
-    // Helper method to check if a string is a valid C# identifier
-    private static bool IsValidCSharpIdentifier(string name) {
+    // Helper method to check if a string is a valid identifier for the specified language
+    private static bool IsValidIdentifier(string name, string language = "") {
+        if (language == LanguageNames.VisualBasic) {
+            return Microsoft.CodeAnalysis.VisualBasic.SyntaxFacts.IsValidIdentifier(name);
+        }
+        // Default to C# validation (also used as a general fallback)
         return SyntaxFacts.IsValidIdentifier(name);
     }
 
     //Disabled for now
     //[McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReplaceAllReferences), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Surgically replaces all references to a symbol with new C# code across the solution. Perfect for systematic API upgrades - e.g., replacing all Console.WriteLine() calls with Logger.Info(). Use filename filters (*.cs, Controller*.cs) to scope changes to specific files.")]
+    [Description("Surgically replaces all references to a symbol with new code across the solution. Perfect for systematic API upgrades - e.g., replacing all Console.WriteLine() calls with Logger.Info(). Use filename filters (*.cs, *.vb, Controller*.cs) to scope changes to specific files.")]
     public static async Task<string> ReplaceAllReferences(
         ISolutionManager solutionManager,
         ICodeModificationService modificationService,
         ILogger<ModificationToolsLogCategory> logger,
         [Description("FQN of the symbol whose references should be replaced.")] string fullyQualifiedSymbolName,
-        [Description("The C# code replace references with.")] string replacementCode,
+        [Description("The code to replace references with (C# or VB.NET, matching the target file's language).")] string replacementCode,
         [Description("Only replace symbols in files with this pattern. Supports globbing (`*`).")] string filenameFilter,
         string commitMessage,
         CancellationToken cancellationToken = default) {
@@ -875,14 +1007,21 @@ public static class ModificationTools {
             }
 
             var sourceMemberNode = await sourceSyntaxRef.GetSyntaxAsync(cancellationToken);
-            if (sourceMemberNode is not MemberDeclarationSyntax memberDeclaration) {
-                throw new McpException($"Source member '{fullyQualifiedMemberName}' is not a valid member declaration.");
-            }
-
             Document sourceDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(currentSolution, sourceMemberNode);
-            Document destinationDocument;
+            bool isVBProject = sourceDocument.Project.Language == LanguageNames.VisualBasic;
+
+            // Get the member declaration – C# uses MemberDeclarationSyntax, VB uses SyntaxNode
+            MemberDeclarationSyntax? memberDeclaration = null;
+            if (!isVBProject) {
+                if (sourceMemberNode is not MemberDeclarationSyntax csDecl) {
+                    throw new McpException($"Source member '{fullyQualifiedMemberName}' is not a valid member declaration.");
+                }
+                memberDeclaration = csDecl;
+            }
+            // For VB.NET, sourceMemberNode is used directly as a SyntaxNode
             INamedTypeSymbol? destinationTypeSymbol = null;
             INamespaceSymbol? destinationNamespaceSymbol = null;
+            Document destinationDocument;
 
             if (destinationSymbol is INamedTypeSymbol typeSym) {
                 destinationTypeSymbol = typeSym;
@@ -911,7 +1050,13 @@ public static class ModificationTools {
                 throw new McpException($"Source and destination are the same. Member '{fullyQualifiedMemberName}' is already in '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
             }
 
-            string memberName = GetMemberName(memberDeclaration);
+            string memberName;
+            if (isVBProject) {
+                // For VB.NET, extract the name from the symbol directly
+                memberName = sourceMemberSymbol.Name;
+            } else {
+                memberName = GetMemberName(memberDeclaration!);
+            }
             INamedTypeSymbol? updatedDestinationTypeSymbol = null;
             if (destinationTypeSymbol != null) {
                 // Re-resolve destinationTypeSymbol from the potentially updated currentSolution
@@ -924,7 +1069,7 @@ public static class ModificationTools {
                 }
             }
 
-            if (updatedDestinationTypeSymbol != null && !IsMemberAllowed(updatedDestinationTypeSymbol, memberDeclaration, memberName, cancellationToken)) {
+            if (!isVBProject && updatedDestinationTypeSymbol != null && !IsMemberAllowed(updatedDestinationTypeSymbol, memberDeclaration!, memberName, cancellationToken)) {
                 throw new McpException($"A member with the name '{memberName}' already exists in destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
             }
 
@@ -932,44 +1077,77 @@ public static class ModificationTools {
                 var actualDestinationDocument = currentSolution.GetDocument(destinationDocument.Id)
                     ?? throw new McpException($"Destination document '{destinationDocument.FilePath}' not found in current solution before adding member.");
 
-                if (updatedDestinationTypeSymbol != null) {
-                    currentSolution = await modificationService.AddMemberAsync(actualDestinationDocument.Id, updatedDestinationTypeSymbol, memberDeclaration, -1, cancellationToken);
-                } else {
-                    if (destinationNamespaceSymbol == null) throw new McpException("Destination namespace symbol is null when expected for namespace move.");
-                    currentSolution = await AddMemberToNamespaceAsync(actualDestinationDocument, destinationNamespaceSymbol, memberDeclaration, modificationService, cancellationToken);
-                }
-
-                // Re-acquire source document and node from the *new* currentSolution
-                var sourceDocumentInCurrentSolution = currentSolution.GetDocument(sourceDocument.Id)
-                    ?? throw new McpException("Source document not found in current solution after adding member to destination.");
-                var syntaxRootOfSourceInCurrentSolution = await sourceDocumentInCurrentSolution.GetSyntaxRootAsync(cancellationToken)
-                    ?? throw new McpException("Could not get syntax root for source document in current solution.");
-
-                // Attempt to find the node again. Its span might have changed if the destination was in the same file.
-                var sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution.FindNode(sourceMemberNode.Span, findInsideTrivia: true, getInnermostNodeForTie: true);
-                if (sourceMemberNodeInCurrentTree == null || !(sourceMemberNodeInCurrentTree is MemberDeclarationSyntax)) {
-                    // Fallback: Try to find by kind and name if span-based lookup failed (e.g. due to formatting changes or other modifications)
-                    sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution
-                        .DescendantNodes()
-                        .OfType<MemberDeclarationSyntax>()
-                        .FirstOrDefault(m => m.Kind() == memberDeclaration.Kind() && GetMemberName(m) == memberName);
-
-                    if (sourceMemberNodeInCurrentTree == null) {
-                        logger.LogWarning("Could not precisely re-locate source member node by original span or by kind/name after destination add. Original span: {Span}. Member kind: {Kind}, Name: {Name}. File: {File}", sourceMemberNode.Span, memberDeclaration.Kind(), memberName, sourceDocumentInCurrentSolution.FilePath);
-                        // As a last resort, if the original node is still part of the new tree (by reference), use it.
-                        // This is risky if the tree has been significantly changed, but better than failing if it's just minor formatting.
-                        if (syntaxRootOfSourceInCurrentSolution.DescendantNodes().Contains(sourceMemberNode)) {
-                            sourceMemberNodeInCurrentTree = sourceMemberNode;
-                            logger.LogWarning("Fallback: Using original source member node reference for removal. This might be risky if tree changed significantly.");
-                        } else {
-                            throw new McpException($"Critically failed to re-locate source member node '{memberName}' in '{sourceDocumentInCurrentSolution.FilePath}' for removal after modifications. Original span {sourceMemberNode.Span}. This usually indicates significant tree changes that broke span tracking or the member was unexpectedly altered or removed.");
-                        }
+                if (isVBProject) {
+                    // VB.NET: use language-agnostic DocumentEditor for both add and remove
+                    if (updatedDestinationTypeSymbol != null) {
+                        // Find the destination type's syntax node
+                        var destSyntaxRef = updatedDestinationTypeSymbol.DeclaringSyntaxReferences.FirstOrDefault();
+                        if (destSyntaxRef == null)
+                            throw new McpException($"Could not find syntax reference for destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                        var destTypeNode = await destSyntaxRef.GetSyntaxAsync(cancellationToken);
+                        var destEditor = await DocumentEditor.CreateAsync(actualDestinationDocument, cancellationToken);
+                        destEditor.AddMember(destTypeNode, sourceMemberNode);
+                        var destChanged = destEditor.GetChangedDocument();
+                        var destFormatted = await modificationService.FormatDocumentAsync(destChanged, cancellationToken);
+                        currentSolution = destFormatted.Project.Solution;
                     } else {
-                        logger.LogInformation("Re-located source member node by kind and name for removal. Original span: {OriginalSpan}, New span: {NewSpan}", sourceMemberNode.Span, sourceMemberNodeInCurrentTree.Span);
+                        if (destinationNamespaceSymbol == null) throw new McpException("Destination namespace symbol is null when expected for namespace move.");
+                        // Add to namespace using VB-specific approach
+                        currentSolution = await AddMemberToNamespaceVBAsync(actualDestinationDocument, destinationNamespaceSymbol, sourceMemberNode, modificationService, cancellationToken);
                     }
-                }
 
-                currentSolution = await RemoveMemberFromParentAsync(sourceDocumentInCurrentSolution, sourceMemberNodeInCurrentTree, modificationService, cancellationToken);
+                    // Remove from source using language-agnostic RemoveNode
+                    var sourceDocInSolution = currentSolution.GetDocument(sourceDocument.Id)
+                        ?? throw new McpException("Source document not found in current solution after adding member to destination.");
+                    var sourceRoot = await sourceDocInSolution.GetSyntaxRootAsync(cancellationToken)
+                        ?? throw new McpException("Could not get syntax root for source document.");
+                    var sourceNodeToRemove = sourceRoot.FindNode(sourceMemberNode.Span, findInsideTrivia: true, getInnermostNodeForTie: true)
+                        ?? sourceMemberNode;
+                    var removeEditor = await DocumentEditor.CreateAsync(sourceDocInSolution, cancellationToken);
+                    removeEditor.RemoveNode(sourceNodeToRemove);
+                    var removeChanged = removeEditor.GetChangedDocument();
+                    var removeFormatted = await modificationService.FormatDocumentAsync(removeChanged, cancellationToken);
+                    currentSolution = removeFormatted.Project.Solution;
+                } else {
+                    if (updatedDestinationTypeSymbol != null) {
+                        currentSolution = await modificationService.AddMemberAsync(actualDestinationDocument.Id, updatedDestinationTypeSymbol, memberDeclaration!, -1, cancellationToken);
+                    } else {
+                        if (destinationNamespaceSymbol == null) throw new McpException("Destination namespace symbol is null when expected for namespace move.");
+                        currentSolution = await AddMemberToNamespaceAsync(actualDestinationDocument, destinationNamespaceSymbol, memberDeclaration!, modificationService, cancellationToken);
+                    }
+
+                    // Re-acquire source document and node from the *new* currentSolution
+                    var sourceDocumentInCurrentSolution = currentSolution.GetDocument(sourceDocument.Id)
+                        ?? throw new McpException("Source document not found in current solution after adding member to destination.");
+                    var syntaxRootOfSourceInCurrentSolution = await sourceDocumentInCurrentSolution.GetSyntaxRootAsync(cancellationToken)
+                        ?? throw new McpException("Could not get syntax root for source document in current solution.");
+
+                    // Attempt to find the node again. Its span might have changed if the destination was in the same file.
+                    var sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution.FindNode(sourceMemberNode.Span, findInsideTrivia: true, getInnermostNodeForTie: true);
+                    if (sourceMemberNodeInCurrentTree == null || !(sourceMemberNodeInCurrentTree is MemberDeclarationSyntax)) {
+                        // Fallback: Try to find by kind and name if span-based lookup failed (e.g. due to formatting changes or other modifications)
+                        sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution
+                            .DescendantNodes()
+                            .OfType<MemberDeclarationSyntax>()
+                            .FirstOrDefault(m => m.Kind() == memberDeclaration!.Kind() && GetMemberName(m) == memberName);
+
+                        if (sourceMemberNodeInCurrentTree == null) {
+                            logger.LogWarning("Could not precisely re-locate source member node by original span or by kind/name after destination add. Original span: {Span}. Member kind: {Kind}, Name: {Name}. File: {File}", sourceMemberNode.Span, memberDeclaration!.Kind(), memberName, sourceDocumentInCurrentSolution.FilePath);
+                            // As a last resort, if the original node is still part of the new tree (by reference), use it.
+                            // This is risky if the tree has been significantly changed, but better than failing if it's just minor formatting.
+                            if (syntaxRootOfSourceInCurrentSolution.DescendantNodes().Contains(sourceMemberNode)) {
+                                sourceMemberNodeInCurrentTree = sourceMemberNode;
+                                logger.LogWarning("Fallback: Using original source member node reference for removal. This might be risky if tree changed significantly.");
+                            } else {
+                                throw new McpException($"Critically failed to re-locate source member node '{memberName}' in '{sourceDocumentInCurrentSolution.FilePath}' for removal after modifications. Original span {sourceMemberNode.Span}. This usually indicates significant tree changes that broke span tracking or the member was unexpectedly altered or removed.");
+                            }
+                        } else {
+                            logger.LogInformation("Re-located source member node by kind and name for removal. Original span: {OriginalSpan}, New span: {NewSpan}", sourceMemberNode.Span, sourceMemberNodeInCurrentTree.Span);
+                        }
+                    }
+
+                    currentSolution = await RemoveMemberFromParentAsync(sourceDocumentInCurrentSolution, sourceMemberNodeInCurrentTree, modificationService, cancellationToken);
+                }
 
                 string finalCommitMessage = $"Move {memberName} to {fullyQualifiedDestinationTypeOrNamespaceName}: {commitMessage}";
                 await modificationService.ApplyChangesAsync(currentSolution, cancellationToken, finalCommitMessage);
@@ -1011,22 +1189,41 @@ public static class ModificationTools {
     }
     /// <summary>
     /// Finds an existing document in the project that contains the specified namespace.
+    /// Supports both C# (.cs) and VB.NET (.vb) files.
     /// </summary>
     private static async Task<Document?> FindExistingDocumentWithNamespaceAsync(Project project, INamespaceSymbol namespaceSymbol, CancellationToken cancellationToken) {
         var namespaceName = namespaceSymbol.ToDisplayString();
+        bool isVB = project.Language == LanguageNames.VisualBasic;
 
         foreach (var document in project.Documents) {
-            if (document.FilePath?.EndsWith(".cs") != true) continue;
+            var ext = Path.GetExtension(document.FilePath);
+            if (isVB) {
+                if (!string.Equals(ext, ".vb", StringComparison.OrdinalIgnoreCase)) continue;
+            } else {
+                if (!string.Equals(ext, ".cs", StringComparison.OrdinalIgnoreCase)) continue;
+            }
 
             var root = await document.GetSyntaxRootAsync(cancellationToken);
-            if (root is CompilationUnitSyntax compilationUnit) {
-                // Check if this document already contains the target namespace
-                var hasNamespace = compilationUnit.Members
-                    .OfType<NamespaceDeclarationSyntax>()
-                    .Any(n => n.Name.ToString() == namespaceName);
 
-                if (hasNamespace || (namespaceSymbol.IsGlobalNamespace && compilationUnit.Members.Any())) {
-                    return document;
+            if (isVB) {
+                if (root is VBSyntax.CompilationUnitSyntax vbCompilationUnit) {
+                    var hasNamespace = vbCompilationUnit.Members
+                        .OfType<VBSyntax.NamespaceBlockSyntax>()
+                        .Any(n => n.NamespaceStatement.Name.ToString() == namespaceName);
+
+                    if (hasNamespace || (namespaceSymbol.IsGlobalNamespace && vbCompilationUnit.Members.Any())) {
+                        return document;
+                    }
+                }
+            } else {
+                if (root is CompilationUnitSyntax compilationUnit) {
+                    var hasNamespace = compilationUnit.Members
+                        .OfType<NamespaceDeclarationSyntax>()
+                        .Any(n => n.Name.ToString() == namespaceName);
+
+                    if (hasNamespace || (namespaceSymbol.IsGlobalNamespace && compilationUnit.Members.Any())) {
+                        return document;
+                    }
                 }
             }
         }
@@ -1035,12 +1232,16 @@ public static class ModificationTools {
     }
     /// <summary>
     /// Creates a new document for the specified namespace.
+    /// Uses the project's language to determine the file extension and content template.
     /// </summary>
     private static Task<Document> CreateDocumentForNamespaceAsync(Project project, INamespaceSymbol namespaceSymbol, CancellationToken cancellationToken) {
         var namespaceName = namespaceSymbol.ToDisplayString();
+        bool isVB = project.Language == LanguageNames.VisualBasic;
+        string fileExtension = isVB ? ".vb" : ".cs";
+
         var fileName = string.IsNullOrEmpty(namespaceName) || namespaceSymbol.IsGlobalNamespace
-            ? "GlobalNamespace.cs"
-            : $"{namespaceName.Split('.').Last()}.cs";
+            ? $"GlobalNamespace{fileExtension}"
+            : $"{namespaceName.Split('.').Last()}{fileExtension}";
 
         // Ensure the file name doesn't conflict with existing files
         var baseName = Path.GetFileNameWithoutExtension(fileName);
@@ -1055,10 +1256,17 @@ public static class ModificationTools {
             counter++;
         }
 
-        // Create basic content for the new file
-        var content = namespaceSymbol.IsGlobalNamespace
-            ? "// Global namespace file\n"
-            : $"namespace {namespaceName} {{\n    // Namespace content\n}}\n";
+        // Create basic content for the new file using the correct language syntax
+        string content;
+        if (isVB) {
+            content = namespaceSymbol.IsGlobalNamespace
+                ? "' Global namespace file\n"
+                : $"Namespace {namespaceName}\n    ' Namespace content\nEnd Namespace\n";
+        } else {
+            content = namespaceSymbol.IsGlobalNamespace
+                ? "// Global namespace file\n"
+                : $"namespace {namespaceName} {{\n    // Namespace content\n}}\n";
+        }
 
         var newDocument = project.AddDocument(fileName, content, filePath: fullPath);
         return Task.FromResult(newDocument);
@@ -1092,6 +1300,42 @@ public static class ModificationTools {
             } else {
                 // Add member to existing namespace
                 editor.AddMember(targetNamespace, memberDeclaration);
+            }
+        }
+
+        var changedDocument = editor.GetChangedDocument();
+        var formattedDocument = await modificationService.FormatDocumentAsync(changedDocument, cancellationToken);
+        return formattedDocument.Project.Solution;
+    }
+    /// <summary>
+    /// Adds a VB.NET member to the specified namespace in the given document.
+    /// </summary>
+    private static async Task<Solution> AddMemberToNamespaceVBAsync(Document document, INamespaceSymbol namespaceSymbol, SyntaxNode memberNode, ICodeModificationService modificationService, CancellationToken cancellationToken) {
+        var root = await document.GetSyntaxRootAsync(cancellationToken);
+        if (root is not VBSyntax.CompilationUnitSyntax vbCompilationUnit) {
+            throw new McpException("Destination VB.NET document does not have a valid compilation unit.");
+        }
+
+        var editor = await DocumentEditor.CreateAsync(document, cancellationToken);
+
+        if (namespaceSymbol.IsGlobalNamespace) {
+            editor.AddMember(vbCompilationUnit, memberNode);
+        } else {
+            var namespaceName = namespaceSymbol.ToDisplayString();
+            var targetNamespace = vbCompilationUnit.Members
+                .OfType<VBSyntax.NamespaceBlockSyntax>()
+                .FirstOrDefault(n => n.NamespaceStatement.Name.ToString() == namespaceName);
+
+            if (targetNamespace == null) {
+                // Create the namespace and add the member to it
+                var nsStatement = VBSyntaxFactory.NamespaceStatement(VBSyntaxFactory.ParseName(namespaceName));
+                var newNsBlock = VBSyntaxFactory.NamespaceBlock(nsStatement);
+                if (memberNode is VBSyntax.StatementSyntax vbStatement) {
+                    newNsBlock = newNsBlock.AddMembers(vbStatement);
+                }
+                editor.AddMember(vbCompilationUnit, newNsBlock);
+            } else {
+                editor.AddMember(targetNamespace, memberNode);
             }
         }
 
