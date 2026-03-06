@@ -5,6 +5,9 @@
 <Nullable>enable</Nullable>
 </PropertyGroup>
 <ItemGroup>
+<InternalsVisibleTo Include="SharpTools.Tests" />
+</ItemGroup>
+<ItemGroup>
 <PackageReference Include="DiffPlex" Version="1.9.0" />
 <PackageReference Include="ICSharpCode.Decompiler" Version="9.1.0.7988" />
 <PackageReference Include="LibGit2Sharp" Version="0.31.0" />
