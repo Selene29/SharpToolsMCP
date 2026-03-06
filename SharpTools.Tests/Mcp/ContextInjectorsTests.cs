@@ -77,7 +77,6 @@ public class ContextInjectorsTests
     [Test]
     public async Task CreateCodeDiff_NormalizesWhitespace()
     {
-        // Identical content with different whitespace should show no changes
         var oldCode = "public class Test { }";
         var newCode = "  public class Test { }  ";
 

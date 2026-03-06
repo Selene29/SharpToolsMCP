@@ -203,7 +203,7 @@ public class LegacyNuGetPackageReaderTests
     [Test]
     public async Task GetPackagesFromConfig_WithNull_ReturnsEmpty()
     {
-        var packages = LegacyNuGetPackageReader.GetPackagesFromConfig(null);
+        var packages = LegacyNuGetPackageReader.GetPackagesFromConfig(null!);
 
         await Assert.That(packages.Count).IsEqualTo(0);
     }
